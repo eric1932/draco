@@ -19,6 +19,7 @@
 #include "draco/core/cycle_timer.h"
 #include "draco/io/file_utils.h"
 #include "draco/io/mesh_io.h"
+#include "draco/io/ply_decoder.h"
 #include "draco/io/point_cloud_io.h"
 
 namespace {
@@ -367,4 +368,137 @@ int main(int argc, char **argv) {
   }
 
   return ret;
+}
+
+draco::StatusOr<std::unique_ptr<draco::PointCloud>> ReadPointCloudFromCharArray(
+    unsigned char *charArray, int length) {
+  std::vector<char> data(length);
+  std::memcpy(&data[0], charArray,
+              length * sizeof(char));  // TODO validate; deduplicate w/ buffer_
+
+  draco::DecoderBuffer buffer_;
+  draco::PlyDecoder plyDecoder;
+  std::unique_ptr<draco::PointCloud> pc(new draco::PointCloud());
+  draco::PointCloud *out_point_cloud = pc.get();
+  buffer_.Init(data.data(), data.size());
+  plyDecoder.DecodeFromBuffer(&buffer_, out_point_cloud);
+
+  return std::move(pc);
+}
+
+std::vector<char> EncodePointCloudToBuffer(const draco::PointCloud &pc,
+                                           draco::Encoder *encoder) {
+  draco::CycleTimer timer;
+  // Encode the geometry.
+  draco::EncoderBuffer buffer;
+  timer.Start();
+  const draco::Status status = encoder->EncodePointCloudToBuffer(pc, &buffer);
+  if (!status.ok()) {
+    printf("Failed to encode the point cloud.\n");
+    printf("%s\n", status.error_msg());
+    return std::vector<char>();
+  }
+  timer.Stop();
+  printf("Encoded point cloud saved (%" PRId64 " ms to encode).\n",
+         timer.GetInMs());
+  printf("\nEncoded size = %zu bytes\n\n", buffer.size());
+  return *buffer.buffer();
+}
+
+extern "C" __declspec(dllexport) unsigned char *__stdcall encodePointCloud(
+    unsigned char *charArray, int length, int *outLength) {
+  Options options;
+
+  // Eric code
+  options.is_point_cloud = true;
+
+  std::unique_ptr<draco::PointCloud> pc;
+  auto maybe_pc = ReadPointCloudFromCharArray(charArray, length);
+  if (!maybe_pc.ok()) {
+    printf("Failed loading the input point cloud: %s.\n",
+           maybe_pc.status().error_msg());
+    return nullptr;
+  }
+  pc = std::move(maybe_pc).value();
+
+  if (options.pos_quantization_bits < 0) {
+    printf("Error: Position attribute cannot be skipped.\n");
+    return nullptr;
+  }
+
+  // Delete attributes if needed. This needs to happen before we set any
+  // quantization settings.
+  if (options.tex_coords_quantization_bits < 0) {
+    if (pc->NumNamedAttributes(draco::GeometryAttribute::TEX_COORD) > 0) {
+      options.tex_coords_deleted = true;
+    }
+    while (pc->NumNamedAttributes(draco::GeometryAttribute::TEX_COORD) > 0) {
+      pc->DeleteAttribute(
+          pc->GetNamedAttributeId(draco::GeometryAttribute::TEX_COORD, 0));
+    }
+  }
+  if (options.normals_quantization_bits < 0) {
+    if (pc->NumNamedAttributes(draco::GeometryAttribute::NORMAL) > 0) {
+      options.normals_deleted = true;
+    }
+    while (pc->NumNamedAttributes(draco::GeometryAttribute::NORMAL) > 0) {
+      pc->DeleteAttribute(
+          pc->GetNamedAttributeId(draco::GeometryAttribute::NORMAL, 0));
+    }
+  }
+  if (options.generic_quantization_bits < 0) {
+    if (pc->NumNamedAttributes(draco::GeometryAttribute::GENERIC) > 0) {
+      options.generic_deleted = true;
+    }
+    while (pc->NumNamedAttributes(draco::GeometryAttribute::GENERIC) > 0) {
+      pc->DeleteAttribute(
+          pc->GetNamedAttributeId(draco::GeometryAttribute::GENERIC, 0));
+    }
+  }
+#ifdef DRACO_ATTRIBUTE_INDICES_DEDUPLICATION_SUPPORTED
+  // If any attribute has been deleted, run deduplication of point indices again
+  // as some points can be possibly combined.
+  if (options.tex_coords_deleted || options.normals_deleted ||
+      options.generic_deleted) {
+    pc->DeduplicatePointIds();
+  }
+#endif
+
+  // Convert compression level to speed (that 0 = slowest, 10 = fastest).
+  const int speed = 10 - options.compression_level;
+
+  draco::Encoder encoder;
+
+  // Setup encoder options.
+  if (options.pos_quantization_bits > 0) {
+    encoder.SetAttributeQuantization(draco::GeometryAttribute::POSITION,
+                                     options.pos_quantization_bits);
+  }
+  if (options.tex_coords_quantization_bits > 0) {
+    encoder.SetAttributeQuantization(draco::GeometryAttribute::TEX_COORD,
+                                     options.tex_coords_quantization_bits);
+  }
+  if (options.normals_quantization_bits > 0) {
+    encoder.SetAttributeQuantization(draco::GeometryAttribute::NORMAL,
+                                     options.normals_quantization_bits);
+  }
+  if (options.generic_quantization_bits > 0) {
+    encoder.SetAttributeQuantization(draco::GeometryAttribute::GENERIC,
+                                     options.generic_quantization_bits);
+  }
+  encoder.SetSpeedOptions(speed, speed);
+
+  // if (options.output.empty()) {
+  //  // Create a default output file by attaching .drc to the input file name.
+  //  options.output = options.input + ".drc";
+  //}
+
+  PrintOptions(*pc, options);
+
+  std::vector<char> buffer = EncodePointCloudToBuffer(*pc, &encoder);
+  void *returnBufPtr = malloc(buffer.size());
+  memcpy(returnBufPtr, buffer.data(), buffer.size());
+
+  *outLength = buffer.size();
+  return (unsigned char *)returnBufPtr;
 }
